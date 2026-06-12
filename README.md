@@ -4,8 +4,6 @@
 
 🔗 Live Demo: [![Live Demo](https://img.shields.io/badge/Live-Demo-brightgreen)](https://papermind-ai-gvkr.streamlit.app/)
 
-📂 Source Code: https://github.com/<your-username>/PaperMind-AI
-
 PaperMind AI is a Streamlit app for reading research papers faster. Upload a text-based PDF, ask grounded questions, generate summaries, identify research gaps, prepare interview answers, and export study material.
 
 ## Features
