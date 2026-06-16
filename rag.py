@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Iterable
+import logging
+from typing import Iterable, List, Dict, Tuple, Any
 
 import faiss
 import numpy as np
@@ -13,19 +14,12 @@ from google.genai import types
 from prompts import CHAT_PROMPT
 from utils import get_embedding_model, get_max_embedding_chunks
 
+logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
-TOP_K = 4
+TOP_K = 6
 EMBEDDING_BATCH_SIZE = 100
-
-
-@dataclass
-class RetrievedChunk:
-    text: str
-    page: int
-    score: float
-
 
 @dataclass
 class VectorStore:
@@ -35,8 +29,8 @@ class VectorStore:
     embedding_model: str
     total_chunks: int
     embedded_chunks: int
-    metadata: dict
-
+    metadata: dict  # Map of paper_title -> metadata_dict
+    chunk_sources: list[dict] = None  # List of {"title": str, "page": int}
 
 def _clean_metadata_value(value) -> str | None:
     if not value:
@@ -45,13 +39,11 @@ def _clean_metadata_value(value) -> str | None:
     cleaned = cleaned.strip("\x00")
     return cleaned or None
 
-
 def _extract_year(text: str, fallback: str | None = None) -> str | None:
     match = re.search(r"\b(?:19|20)\d{2}\b", text)
     if match:
         return match.group(0)
     return fallback
-
 
 def _looks_like_author_line(line: str) -> bool:
     author_indicators = (",", " and ", ";", "university", "institute", "department")
@@ -59,9 +51,8 @@ def _looks_like_author_line(line: str) -> bool:
     if re.search(r"\b(abstract|introduction|keywords|doi|arxiv)\b", lower_line):
         return False
     return any(indicator in lower_line for indicator in author_indicators) or bool(
-        re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z]+)\b", line)
+        re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z]\.)?(%s+)?" % r"[A-Z][a-z]+", line)
     )
-
 
 def _extract_title_from_lines(lines: list[str]) -> str | None:
     title_lines = []
@@ -74,7 +65,6 @@ def _extract_title_from_lines(lines: list[str]) -> str | None:
 
     title = " ".join(title_lines).strip()
     return title if title else None
-
 
 def extract_metadata(reader: PdfReader, pages: list[dict]) -> dict:
     """Extract lightweight paper metadata from PDF metadata and first-page text."""
@@ -112,29 +102,18 @@ def extract_metadata(reader: PdfReader, pages: list[dict]) -> dict:
         "pages": len(reader.pages),
     }
 
-
 def extract_pages(reader: PdfReader) -> list[dict]:
     pages = []
-
     for page_number, page in enumerate(reader.pages, start=1):
         raw_text = page.extract_text() or ""
         text = " ".join(raw_text.split())
         if text:
             pages.append({"page": page_number, "text": text, "raw_text": raw_text})
-
     if not pages:
         raise ValueError("No readable text found in this PDF. Scanned PDFs may need OCR.")
-
     return pages
 
-
-def extract_text(pdf_file) -> list[dict]:
-    """Extract page-wise text from an uploaded PDF file."""
-    return extract_pages(PdfReader(pdf_file))
-
-
 def split_text(pages: list[dict], chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP) -> tuple[list[str], list[int]]:
-    """Split extracted PDF text into overlapping chunks."""
     if chunk_overlap >= chunk_size:
         raise ValueError("chunk_overlap must be smaller than chunk_size.")
 
@@ -157,77 +136,135 @@ def split_text(pages: list[dict], chunk_size: int = CHUNK_SIZE, chunk_overlap: i
 
     return chunks, page_numbers
 
-
 def _embed_texts(
     client: genai.Client,
     texts: Iterable[str],
     task_type: str,
     model: str | None = None,
 ) -> np.ndarray:
+    import time
     embedding_model = model or get_embedding_model()
     text_list = list(texts)
     vectors = []
 
     for start in range(0, len(text_list), EMBEDDING_BATCH_SIZE):
         batch = text_list[start : start + EMBEDDING_BATCH_SIZE]
-        result = client.models.embed_content(
-            model=embedding_model,
-            contents=batch,
-            config=types.EmbedContentConfig(task_type=task_type),
-        )
-        vectors.extend(embedding.values for embedding in result.embeddings)
+        
+        retries = 4
+        delay = 10
+        for attempt in range(retries):
+            try:
+                result = client.models.embed_content(
+                    model=embedding_model,
+                    contents=batch,
+                    config=types.EmbedContentConfig(task_type=task_type),
+                )
+                vectors.extend(embedding.values for embedding in result.embeddings)
+                break
+            except Exception as e:
+                err_str = str(e).upper()
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    if attempt < retries - 1:
+                        logger.warning(f"Gemini Embedding Rate Limit (429) hit. Retrying in {delay} seconds (attempt {attempt + 1}/{retries})...")
+                        time.sleep(delay)
+                        delay *= 2
+                        continue
+                raise e
 
     array = np.array(vectors, dtype="float32")
     faiss.normalize_L2(array)
     return array
 
-
-def create_vector_store(client: genai.Client, chunks: list[str], page_numbers: list[int]) -> VectorStore:
-    """Create a FAISS vector store from text chunks."""
-    embedding_model = get_embedding_model()
-    embeddings = _embed_texts(
-        client,
-        chunks,
-        task_type="RETRIEVAL_DOCUMENT",
-        model=embedding_model,
-    )
-    index = faiss.IndexFlatIP(embeddings.shape[1])
-    index.add(embeddings)
-    return VectorStore(
-        index=index,
-        chunks=chunks,
-        pages=page_numbers,
-        embedding_model=embedding_model,
-        total_chunks=len(chunks),
-        embedded_chunks=len(chunks),
-        metadata={},
-    )
-
-
 def build_vector_store(client: genai.Client, pdf_file) -> VectorStore:
+    """Build the initial vector store for a single uploaded PDF."""
     pdf_file.seek(0)
     reader = PdfReader(pdf_file)
     pages = extract_pages(reader)
     metadata = extract_metadata(reader, pages)
+    
+    paper_title = metadata.get("title", "Unknown")
+    chunks, page_numbers = split_text(pages)
+    
+    total_chunks = len(chunks)
+    max_chunks = get_max_embedding_chunks()
+    chunks = chunks[:max_chunks]
+    page_numbers = page_numbers[:max_chunks]
+    
+    embeddings = _embed_texts(
+        client,
+        chunks,
+        task_type="RETRIEVAL_DOCUMENT"
+    )
+    
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+    
+    chunk_sources = [{"title": paper_title, "page": page} for page in page_numbers]
+    
+    return VectorStore(
+        index=index,
+        chunks=chunks,
+        pages=page_numbers,
+        embedding_model=get_embedding_model(),
+        total_chunks=total_chunks,
+        embedded_chunks=len(chunks),
+        metadata={paper_title: metadata},
+        chunk_sources=chunk_sources
+    )
+
+def add_paper_to_store(client: genai.Client, vector_store: VectorStore, pdf_file) -> VectorStore:
+    """Parse, embed, and append a new paper into the existing VectorStore index."""
+    pdf_file.seek(0)
+    reader = PdfReader(pdf_file)
+    pages = extract_pages(reader)
+    metadata = extract_metadata(reader, pages)
+    
+    paper_title = metadata.get("title", "Unknown")
+    if paper_title in vector_store.metadata:
+        # Avoid double indexing the same paper title
+        return vector_store
+
     chunks, page_numbers = split_text(pages)
     total_chunks = len(chunks)
     max_chunks = get_max_embedding_chunks()
     chunks = chunks[:max_chunks]
     page_numbers = page_numbers[:max_chunks]
-    vector_store = create_vector_store(client, chunks, page_numbers)
-    vector_store.total_chunks = total_chunks
-    vector_store.embedded_chunks = len(chunks)
-    vector_store.metadata = metadata
+    
+    embeddings = _embed_texts(
+        client,
+        chunks,
+        task_type="RETRIEVAL_DOCUMENT",
+        model=vector_store.embedding_model
+    )
+    
+    # Append to existing index
+    vector_store.index.add(embeddings)
+    
+    # Append to lists
+    start_idx = len(vector_store.chunks)
+    vector_store.chunks.extend(chunks)
+    vector_store.pages.extend(page_numbers)
+    
+    if vector_store.chunk_sources is None:
+        # Fallback populate for legacy chunks
+        vector_store.chunk_sources = [{"title": list(vector_store.metadata.keys())[0], "page": p} for p in vector_store.pages[:start_idx]]
+        
+    for page in page_numbers:
+        vector_store.chunk_sources.append({"title": paper_title, "page": page})
+        
+    vector_store.metadata[paper_title] = metadata
+    vector_store.total_chunks += total_chunks
+    vector_store.embedded_chunks += len(chunks)
+    
     return vector_store
-
 
 def retrieve_context(
     client: genai.Client,
     vector_store: VectorStore,
     question: str,
     top_k: int = TOP_K,
-) -> list[RetrievedChunk]:
-    """Retrieve the most relevant chunks for a user question."""
+) -> list[dict]:
+    """Retrieve top matched chunks mapped to their source paper details."""
     if not question.strip():
         raise ValueError("Question cannot be empty.")
 
@@ -243,54 +280,37 @@ def retrieve_context(
 
     results = []
     for score, index in zip(scores[0], indices[0]):
-        if index == -1:
+        if index == -1 or index >= len(vector_store.chunks):
             continue
-        results.append(
-            RetrievedChunk(
-                text=vector_store.chunks[index],
-                page=vector_store.pages[index],
-                score=float(score),
-            )
-        )
+        
+        # Determine source
+        source_title = "Unknown"
+        page_num = vector_store.pages[index]
+        
+        if vector_store.chunk_sources and index < len(vector_store.chunk_sources):
+            source = vector_store.chunk_sources[index]
+            source_title = source["title"]
+            page_num = source["page"]
+        else:
+            # Fallback
+            if vector_store.metadata:
+                source_title = list(vector_store.metadata.keys())[0]
+
+        results.append({
+            "text": vector_store.chunks[index],
+            "page": page_num,
+            "paper_title": source_title,
+            "score": float(score)
+        })
 
     return results
 
-
-def chunks_to_context(chunks: list[RetrievedChunk]) -> str:
+def chunks_to_context(chunks: list[dict]) -> str:
+    """Format matching chunks as reference blocks for Gemini."""
     return "\n\n".join(
-        f"[Source: page {chunk.page}, relevance {chunk.score:.3f}]\n{chunk.text}"
+        f"[Source: page {chunk['page']}, paper \"{chunk['paper_title']}\", relevance {chunk['score']:.3f}]\n{chunk['text']}"
         for chunk in chunks
     )
-
-
-def _format_page_references(chunks: list[RetrievedChunk]) -> str:
-    pages = sorted({chunk.page for chunk in chunks})
-    if not pages:
-        return ""
-    return ", ".join(f"p. {page}" for page in pages)
-
-
-def add_citation_footer(answer: str, chunks: list[RetrievedChunk]) -> str:
-    """Ensure every answer exposes the retrieved page references."""
-    page_references = _format_page_references(chunks)
-    if not page_references:
-        return answer
-
-    if "Evidence pages:" in answer:
-        return answer
-
-    return f"{answer}\n\n**Evidence pages:** {page_references}"
-
-
-def generate_response(client: genai.Client, model_name: str, prompt: str) -> str:
-    response = client.models.generate_content(model=model_name, contents=prompt)
-    text = getattr(response, "text", None)
-
-    if text:
-        return text.strip()
-
-    raise RuntimeError("Gemini returned an empty response. Try again with a shorter prompt.")
-
 
 def answer_question(
     client: genai.Client,
@@ -298,35 +318,69 @@ def answer_question(
     question: str,
     model_name: str,
 ) -> tuple[str, list[dict]]:
+    """Query FAISS, build prompt, and call Gemini to output cited RAG answer."""
     retrieved_chunks = retrieve_context(client, vector_store, question)
     context = chunks_to_context(retrieved_chunks)
+    
     answer = generate_response(
         client=client,
         model_name=model_name,
         prompt=CHAT_PROMPT.format(context=context, question=question),
     )
-    answer = add_citation_footer(answer, retrieved_chunks)
-    sources = [
-        {"page": chunk.page, "score": chunk.score, "text": chunk.text}
-        for chunk in retrieved_chunks
-    ]
-    return answer, sources
+    
+    return answer, retrieved_chunks
 
+def generate_response(client: genai.Client, model_name: str, prompt: str) -> str:
+    response = client.models.generate_content(model=model_name, contents=prompt)
+    text = getattr(response, "text", None)
+    if text:
+        return text.strip()
+    raise RuntimeError("Gemini returned an empty response.")
 
 def generate_from_full_context(
     client: genai.Client,
     vector_store: VectorStore,
     prompt_template: str,
     model_name: str,
+    focus: str | None = None
 ) -> str:
-    """Generate feature outputs using broad paper context within MVP limits."""
-    selected_chunks = zip(vector_store.chunks[:24], vector_store.pages[:24])
-    context = "\n\n".join(
-        f"[Source: page {page}]\n{chunk}"
-        for chunk, page in selected_chunks
-    )
+    """Select representative chunks from all papers and call Gemini."""
+    # Group chunks by paper
+    papers_chunks: dict[str, list[tuple[str, int]]] = {}
+    
+    # Initialize
+    for title in vector_store.metadata.keys():
+        papers_chunks[title] = []
+        
+    for idx, chunk in enumerate(vector_store.chunks):
+        if vector_store.chunk_sources and idx < len(vector_store.chunk_sources):
+            src = vector_store.chunk_sources[idx]
+            title = src["title"]
+            page = src["page"]
+        else:
+            title = list(vector_store.metadata.keys())[0]
+            page = vector_store.pages[idx]
+            
+        if title in papers_chunks:
+            papers_chunks[title].append((chunk, page))
+            
+    # For each paper, collect the first 8 chunks (introductory text)
+    selected_context_blocks = []
+    for title, chunk_list in papers_chunks.items():
+        for chunk, page in chunk_list[:8]:
+            selected_context_blocks.append(f"[Source: page {page}, paper \"{title}\"]\n{chunk}")
+            
+    context = "\n\n".join(selected_context_blocks)
+    
+    if focus is not None:
+        # literature review format
+        prompt = prompt_template.format(context=context, focus_guidelines=focus)
+    else:
+        # general summary or gap analysis format
+        prompt = prompt_template.format(context=context)
+        
     return generate_response(
         client=client,
         model_name=model_name,
-        prompt=prompt_template.format(context=context),
+        prompt=prompt,
     )
