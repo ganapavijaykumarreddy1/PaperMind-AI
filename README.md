@@ -1,115 +1,64 @@
 # PaperMind AI
 
-**GenAI-powered Research Paper Intelligence Platform**
+**GenAI-powered Multi-Document Research Intelligence Platform**
 
-🔗 Live Demo: [![Live Demo](https://img.shields.io/badge/Live-Demo-brightgreen)](https://papermind-ai-gvkr.streamlit.app/)
+PaperMind AI is a Streamlit-native application designed to accelerate scientific literature analysis. Upload multiple research papers (PDFs) into an active workspace, chat across documents with page-level grounding, compare methodologies in lit matrices, discover dataset limitations in scored tables, and run external search agents to recommend new literature.
 
-PaperMind AI is a Streamlit app for reading research papers faster. Upload a text-based PDF, ask grounded questions, generate summaries, identify research gaps, prepare interview answers, and export study material.
+---
 
-## Features
+## Key Features
 
-- Upload text-based research paper PDFs
-- Extract paper metadata: title, authors, year, and page count
-- Chunk paper text with page tracking
-- Generate Gemini embeddings and store vectors locally with FAISS
-- Retrieve top relevant chunks for RAG answers
-- Generate citation-aware answers with page references
-- Create concise paper summaries
-- Identify limitations, open challenges, and future research gaps
-- Score research gaps by impact, novelty, and feasibility
-- Generate technical interview questions with answers
-- Draft PPT-ready slide content
-- Download summaries as PDF
-- Download interview questions as PDF
+1.  **Multi-Document Workspace**: Upload multiple PDFs. The app extracts metadata (title, authors, year, pages) and cumulatively indexes them into a local FAISS vector store.
+2.  **AI Research Agent**: Autonomously queries the arXiv XML API on a topic, extracts metadata/abstracts, performs a semantic comparison against your workspace using Gemini, and recommends papers to add.
+3.  **Grounded Chat**: Ask questions across all workspace papers. Gemini answers using strictly retrieved contexts and cites page numbers like `[p. X, "Paper Title"]` inside glowing glassmorphic cards.
+4.  **Document Summary**: Generates a unified overview summarizing the core research objectives, methodology commonalities, and key findings of the indexed papers.
+5.  **Literature Review Matrix**: Synthesizes workspace documents into a comparative review layout, highlighting architecture differences and open controversies, with support for custom focus prompts.
+6.  **Research Gap Scorecard**: Evaluates methodology limitations and unresolved challenges, presenting them in a compact, styled scorecard table with novelty, feasibility, and impact metrics.
+7.  **Technical Interview Prep**: Generates focused questions and answers grounded in your documents for thesis defense or study preparation.
+8.  **Presentation Slides**: Outlines slide layouts (collective objectives, benchmarks, limitations) to jumpstart slide decks.
+9.  **Rate-Limit Resilience**: Incorporates automatic exponential backoff retries (catching `429 RESOURCE_EXHAUSTED` errors) to handle large document ingestion smoothly in the Gemini free tier.
+10. **Report Exports**: Compile summaries, reviews, gaps, and interview prep into raw Markdown or publication-quality PDFs.
 
-## Architecture
+---
 
-```text
-PDF Upload
-  -> PyPDF Text Extraction
-  -> Metadata Extraction
-  -> Page-Aware Text Chunking
-  -> Gemini Embeddings
-  -> FAISS Vector Store
-  -> Top-k Retrieval
-  -> Gemini Response with Citations
-  -> PDF Export
-```
+## Design & Aesthetics
 
-## Project Structure
+The interface is styled using a custom glassmorphic stylesheet:
+*   **Theme**: Deep indigo-slate radial background canvas (`#17153B` to `#03001C`).
+*   **Layout**: Clear sidebar manager with document cards, pill-shaped central tab navigations, and expandable evidence blocks.
+*   **Typography**: Clean sans-serif weights powered by Google Fonts (*Inter* and *Outfit*).
 
-```text
-PaperMind-AI/
-├── app.py
-├── rag.py
-├── prompts.py
-├── utils.py
-├── requirements.txt
-└── README.md
-```
-
-## Local Setup
-
-1. Create and activate a virtual environment.
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-```
-
-2. Install dependencies.
-
-```bash
-pip install -r requirements.txt
-```
-
-3. Add your Gemini API key.
-
-Create a `.env` file:
-
-```env
-GEMINI_API_KEY=your_api_key_here
-GEMINI_MODEL=gemini-2.5-flash
-GEMINI_EMBEDDING_MODEL=gemini-embedding-001
-MAX_EMBEDDING_CHUNKS=90
-```
-
-4. Run the app.
-
-```bash
-streamlit run app.py
-```
-
-## Streamlit Community Cloud Deployment
-
-1. Push `PaperMind-AI` to a GitHub repository.
-2. Open Streamlit Community Cloud.
-3. Create a new app and select `app.py`.
-4. Add secrets in Streamlit Cloud:
-
-```toml
-GEMINI_API_KEY = "your_api_key_here"
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
-MAX_EMBEDDING_CHUNKS = "90"
-```
-
-5. Deploy the app.
-
-## Notes
-
-- Designed for single-user demos, student projects, and research workflows.
-- Scanned PDFs may not work because they require OCR.
-- No authentication, database, or multi-user persistence is included by design.
-- Large papers are capped to the first 90 chunks by default to avoid Gemini free-tier embedding limits. Increase `MAX_EMBEDDING_CHUNKS` if your quota allows it.
-- Page citations are generated from retrieved text chunks, so citations depend on PDF text extraction quality.
+---
 
 ## Tech Stack
 
-- Python
-- Streamlit
-- Gemini 2.5 Flash
-- Gemini Embeddings
-- FAISS
-- PyPDF
-- ReportLab
+*   **Core**: Python, Streamlit
+*   **LLM & RAG**: Google GenAI SDK (Gemini 2.5 Flash, Gemini Embeddings)
+*   **Vector Search**: Facebook AI Similarity Search (FAISS)
+*   **PDF Extraction**: PyPDF
+*   **Export Engine**: ReportLab (for custom-styled PDFs)
+
+---
+
+## Local Setup
+
+1.  **Activate Virtual Environment**:
+    ```bash
+    python -m venv .venv
+    .venv\Scripts\activate
+    ```
+2.  **Install Dependencies**:
+    ```bash
+    pip install -r requirements.txt
+    ```
+3.  **Create `.env` File**:
+    ```env
+    GEMINI_API_KEY=your_gemini_api_key_here
+    GEMINI_MODEL=gemini-2.5-flash
+    GEMINI_EMBEDDING_MODEL=gemini-embedding-001
+    MAX_EMBEDDING_CHUNKS=80
+    ```
+4.  **Run Streamlit**:
+    ```bash
+    streamlit run app.py
+    ```
